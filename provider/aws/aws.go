@@ -559,6 +559,13 @@ func (p *AWSProvider) records(ctx context.Context, zones map[string]*profiledZon
 						NewEndpointWithTTL(name, string(r.Type), ttl, aliasTarget).
 						WithProviderSpecific(providerSpecificEvaluateTargetHealth, fmt.Sprintf("%t", r.AliasTarget.EvaluateTargetHealth)).
 						WithAliasProperty(endpoint.AliasTrue)
+					// Read back the alias target's hosted zone so the planner converges
+					// for records managed with the aws-target-hosted-zone annotation.
+					// Same-zone aliases are left without the property: the desired
+					// endpoint doesn't carry it either (see adjustAliasRecord).
+					if targetHostedZone := cleanZoneID(aws.ToString(r.AliasTarget.HostedZoneId)); targetHostedZone != "" && targetHostedZone != cleanZoneID(aws.ToString(z.zone.Id)) {
+						ep.WithProviderSpecific(providerSpecificTargetHostedZone, targetHostedZone)
+					}
 					newEndpoints = append(newEndpoints, ep)
 				}
 
@@ -879,6 +886,15 @@ func (p *AWSProvider) adjustAliasRecord(ep *endpoint.Endpoint) {
 	} else {
 		// if not set, use provider default
 		ep.SetProviderSpecificProperty(providerSpecificEvaluateTargetHealth, strconv.FormatBool(p.evaluateTargetHealth))
+	}
+
+	// Mirror the target hosted zone onto the desired endpoint so the planner
+	// converges with what records() reads back from AliasTarget.HostedZoneId.
+	// Same-zone aliases are left without the property on both sides.
+	if _, ok := ep.GetProviderSpecificProperty(providerSpecificTargetHostedZone); !ok {
+		if targetHostedZone := isAWSAlias(ep); targetHostedZone != "" && targetHostedZone != sameZoneAlias {
+			ep.SetProviderSpecificProperty(providerSpecificTargetHostedZone, cleanZoneID(targetHostedZone))
+		}
 	}
 }
 
