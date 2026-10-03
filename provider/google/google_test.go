@@ -25,6 +25,7 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -131,6 +132,12 @@ type mockChangesCreateCall struct {
 	project     string
 	managedZone string
 	change      *dns.Change
+	ctx         context.Context
+}
+
+func (m *mockChangesCreateCall) Context(ctx context.Context) changesCreateCallInterface {
+	m.ctx = ctx
+	return m
 }
 
 func (m *mockChangesCreateCall) Do(_ ...googleapi.CallOption) (*dns.Change, error) {
@@ -456,6 +463,57 @@ func TestGoogleApplyChangesDryRun(t *testing.T) {
 func TestGoogleApplyChangesEmpty(t *testing.T) {
 	provider := newGoogleProvider(t, endpoint.NewDomainFilter([]string{"ext-dns-test-2.gcp.zalan.do."}), provider.NewZoneIDFilter([]string{""}), false, []*endpoint.Endpoint{}, nil, nil)
 	require.NoError(t, provider.ApplyChanges(t.Context(), &plan.Changes{}))
+}
+
+// blockingChangesCreateCall simulates a stalled Cloud DNS API: Do blocks
+// until the request context is done.
+type blockingChangesCreateCall struct {
+	ctx context.Context
+}
+
+func (m *blockingChangesCreateCall) Context(ctx context.Context) changesCreateCallInterface {
+	m.ctx = ctx
+	return m
+}
+
+func (m *blockingChangesCreateCall) Do(_ ...googleapi.CallOption) (*dns.Change, error) {
+	<-m.ctx.Done()
+	return nil, m.ctx.Err()
+}
+
+type blockingChangesClient struct{}
+
+func (blockingChangesClient) Create(_ string, _ string, _ *dns.Change) changesCreateCallInterface {
+	return &blockingChangesCreateCall{ctx: context.Background()}
+}
+
+func TestGoogleSubmitChangeRespectsCancelledContext(t *testing.T) {
+	provider := newGoogleProvider(t, endpoint.NewDomainFilter([]string{"ext-dns-test-2.gcp.zalan.do."}), provider.NewZoneIDFilter([]string{""}), false, nil, nil, nil)
+	provider.changesClient = blockingChangesClient{}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- provider.submitChange(ctx, &dns.Change{
+			Additions: []*dns.ResourceRecordSet{
+				{
+					Name:    "ctx-test.zone-1.ext-dns-test-2.gcp.zalan.do.",
+					Type:    endpoint.RecordTypeA,
+					Ttl:     defaultTTL,
+					Rrdatas: []string{"1.2.3.4"},
+				},
+			},
+		})
+	}()
+
+	select {
+	case err := <-done:
+		require.Error(t, err, "submitChange should fail fast when the context is cancelled")
+	case <-time.After(10 * time.Second):
+		t.Fatal("submitChange did not respect the cancelled context")
+	}
 }
 
 func TestNewFilteredRecords(t *testing.T) {

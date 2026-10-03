@@ -63,6 +63,7 @@ type resourceRecordSetsClientInterface interface {
 }
 
 type changesCreateCallInterface interface {
+	Context(ctx context.Context) changesCreateCallInterface
 	Do(opts ...googleapi.CallOption) (*dns.Change, error)
 }
 
@@ -95,7 +96,22 @@ type changesService struct {
 }
 
 func (c changesService) Create(project string, managedZone string, change *dns.Change) changesCreateCallInterface {
-	return c.service.Create(project, managedZone, change)
+	return changesCreateCall{call: c.service.Create(project, managedZone, change)}
+}
+
+// changesCreateCall adapts *dns.ChangesCreateCall to changesCreateCallInterface.
+// The google API client returns the concrete call type from Context(), which
+// doesn't satisfy the interface's covariant return, hence the wrapper.
+type changesCreateCall struct {
+	call *dns.ChangesCreateCall
+}
+
+func (c changesCreateCall) Context(ctx context.Context) changesCreateCallInterface {
+	return changesCreateCall{call: c.call.Context(ctx)}
+}
+
+func (c changesCreateCall) Do(opts ...googleapi.CallOption) (*dns.Change, error) {
+	return c.call.Do(opts...)
 }
 
 // GoogleProvider is an implementation of Provider for Google CloudDNS.
@@ -138,6 +154,10 @@ func newProvider(ctx context.Context, project string, domainFilter *endpoint.Dom
 	}
 
 	gcloud = extdnshttp.NewInstrumentedClient(gcloud)
+
+	// Bound every API call: without a timeout a single stalled response hangs
+	// the reconcile loop even when the request context is cancelled.
+	gcloud.Timeout = 30 * time.Second
 
 	dnsClient, err := dns.NewService(ctx, option.WithHTTPClient(gcloud))
 	if err != nil {
@@ -302,7 +322,7 @@ func (p *GoogleProvider) submitChange(ctx context.Context, change *dns.Change) e
 				continue
 			}
 
-			if _, err := p.changesClient.Create(p.project, zone, c).Do(); err != nil {
+			if _, err := p.changesClient.Create(p.project, zone, c).Context(ctx).Do(); err != nil {
 				return provider.NewSoftErrorf("failed to create changes: %w", err)
 			}
 
